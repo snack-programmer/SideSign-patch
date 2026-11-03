@@ -199,7 +199,12 @@ public extension DeveloperPortal {
            ?? ((statusDictionary?["hsc"] as? Int) == 409 ? "pushedCode" : nil)
         verboseLog("[SideSign] Authentication status type: \(authType ?? "nil")")
 
-        let locked = Self.resolveClientIdentity(from: anisetteData)
+        // 身份由调用方提供（SideStore 侧真值来自 AppConstants），库内不再做二次改写，
+        // 避免同一会话出现多套 client-info / User-Agent。
+        let locked = (
+            clientInfo: anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines),
+            userAgent: anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         let twoFactorAuthContext = TwoFactorAuthContext(
             dsid: dsid,
             idmsToken: idmsToken,
@@ -385,14 +390,10 @@ public extension DeveloperPortal {
         request.httpMethod = "POST"
         request.httpBody = plistData
 
-        // SideInstaller client_info_to_use — MUST match the ADI library behind anisetteData.
-        // CURRENT_MAC only for Mac ADI (10.12 servers). Android/stock → Windows.
-        // Forcing CURRENT_MAC on Android OTP is Apple error -80045 at login.
-        let resolved = Self.resolveClientIdentity(from: anisetteData)
-        let clientInfo = resolved.clientInfo
-        let userAgent = resolved.userAgent
-        let currentMac = clientInfo
-        let currentMacUA = userAgent
+        // 身份由调用方的 anisetteData 唯一决定（SideStore 侧真值来自 AppConstants），
+        // 库内不再内置任何设备字面量，避免同一会话出现两套身份。
+        let clientInfo = anisetteData.clientInfo
+        let userAgent = anisetteData.userAgent
 
         func applyGrandSlamHeaders(_ req: inout URLRequest, clientInfo: String, userAgent: String) {
             // SideInstaller GrandSlam base_headers + get_headers (Device-Id, MD, MD-M only)
@@ -416,22 +417,13 @@ public extension DeveloperPortal {
             verboseLog("[SideSign] sendAuthenticationRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        // SideInstaller: retry 429; also retry 503 with alternate safe clients (Mac then Windows)
+        // SideInstaller: retry 429/503 时保持同一身份，仅做退避。
         let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000]
-        // Never switch to Windows mid-session on Mac ADI — that causes -80046 after the code
-        let clientFallbacks: [(String, String)] = [
-            (currentMac, currentMacUA),
-            (currentMac, currentMacUA),
-            (currentMac, currentMacUA),
-            (currentMac, currentMacUA),
-        ]
         var data = Data()
         var response: URLResponse = URLResponse(url: Constants.URLs.grandSlamAuth, mimeType: nil, expectedContentLength: 0, textEncodingName: nil)
         var statusCode = 0
         var attempt = 0
         while true {
-            let pair = clientFallbacks[min(attempt, clientFallbacks.count - 1)]
-            applyGrandSlamHeaders(&request, clientInfo: pair.0, userAgent: pair.1)
             do {
                 (data, response) = try await dataWithFreshConnection(for: request)
             } catch {
@@ -443,7 +435,7 @@ public extension DeveloperPortal {
             let retryable = statusCode == HTTPStatusCodes.tooManyRequests || statusCode == 503 || statusCode == 433
             if retryable, attempt < retryDelays.count {
                 let delay = retryDelays[attempt]
-                debugLog("[SideSign] GrandSlam HTTP \(statusCode) — retry \(attempt + 1) in \(delay / 1_000_000_000)s client=\(pair.0.prefix(40))...")
+                debugLog("[SideSign] GrandSlam HTTP \(statusCode) — retry \(attempt + 1) in \(delay / 1_000_000_000)s client=\(clientInfo.prefix(40))...")
                 try await Task.sleep(nanoseconds: delay)
                 attempt += 1
                 continue
@@ -653,33 +645,17 @@ public extension DeveloperPortal {
         return (phoneID, mode)
     }
 
-    private func throwIfXMLUIErrorAlert(in data: Data, statusCode: Int, actionName: String) throws {
-        let (xmluiTitle, xmluiMessage) = parseXMLUIAlertMessage(from: data)
-        if xmluiTitle != nil || xmluiMessage != nil {
-            let alertMsg = [xmluiTitle, xmluiMessage]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: ": ")
-            debugLog("[SideSign] \(actionName) alert from Apple (HTTP \(statusCode)): \(alertMsg)")
-            // Always map to PHONE_CODE_REFUSED — never pass Apple's iCloud wording to the UI
-            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
-        }
-    }
-
     /// True when Apple's 2FA page refused SMS/voice (often shown as "Could not connect to iCloud").
     private static func isPhoneOrICloudRefuse(_ text: String?) -> Bool {
         guard let t = text?.lowercased(), !t.isEmpty else { return false }
         return t.contains("icloud")
             || t.contains("could not connect")
-            || t.contains("phone_code_refused")
-            || t == "phone_code_refused"
-            || t.contains("could not connect to icloud")
     }
 
     /// Never show Apple's "Could not connect to iCloud" / internal markers to the user.
     private static func sanitize2FAUserMessage(_ text: String?) -> String {
         guard let text, !text.isEmpty else { return "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way." }
-        if isPhoneOrICloudRefuse(text) || text == "PHONE_CODE_REFUSED" {
+        if isPhoneOrICloudRefuse(text) {
             return "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
         }
         let lower = text.lowercased()
@@ -743,8 +719,8 @@ public extension DeveloperPortal {
     private enum SideInstallerLoginState {
         case needsDevice2FA
         case needsDevice2FAVerification
-        case needsSMS2FA(phoneID: String)
-        case needsSMS2FAVerification(phoneID: String)
+        case needsPhone2FA(phoneID: String, mode: TwoFactorDeliveryMode)
+        case needsPhone2FAVerification(phoneID: String, mode: TwoFactorDeliveryMode)
     }
 
     private func handle2FARequest(isTrustedDevice: Bool,
@@ -775,24 +751,15 @@ public extension DeveloperPortal {
             .selectDeliveryMethod(preferredMode: preferredMode, phoneNumbers: phoneNumbers)
         )
 
+
         var state: SideInstallerLoginState
         switch initialChoice {
         case .requestTrustedDevice:
             state = codeAlreadySent ? .needsDevice2FAVerification : .needsDevice2FA
         case .requestSMS(let id):
-            state = .needsSMS2FA(phoneID: id.isEmpty ? phoneID0 : id)
+            state = .needsPhone2FA(phoneID: id.isEmpty ? phoneID0 : id, mode: .sms)
         case .requestVoice(let id):
-            // Voice is handled like SMS after the call is requested in the loop
-            let voiceID = id.isEmpty ? phoneID0 : id
-            do {
-                let result = try await sendPhone2FACodeRequest(
-                    mode: "voice", phoneID: voiceID, knownPhoneNumbers: phoneNumbers, context: context)
-                phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
-                state = .needsSMS2FAVerification(phoneID: result.phoneID)
-            } catch {
-                // Fall back to device flow if voice is refused
-                state = .needsDevice2FA
-            }
+            state = .needsPhone2FA(phoneID: id.isEmpty ? phoneID0 : id, mode: .voice)
         case .verificationCode(_):
             // Unexpected at method selection — treat as cancel
             throw DeveloperPortalError.userCancelled
@@ -812,17 +779,20 @@ public extension DeveloperPortal {
                 }
                 state = .needsDevice2FAVerification
 
-            case .needsSMS2FA(let phoneID):
+            case .needsPhone2FA(let phoneID, let mode):
                 do {
                     let result = try await sendPhone2FACodeRequest(
-                        mode: "sms", phoneID: phoneID, knownPhoneNumbers: phoneNumbers, context: ctx)
+                        mode: mode.rawValue, phoneID: phoneID, knownPhoneNumbers: phoneNumbers, context: ctx)
                     phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
                     pendingError = nil
-                    state = .needsSMS2FAVerification(phoneID: result.phoneID)
-                } catch {
-                    debugLog("[SideSign] SI PHONE_CODE_REFUSED → NeedsDevice2FA")
+                    state = .needsPhone2FAVerification(phoneID: result.phoneID, mode: mode)
+                } catch DeveloperPortalError.invalid2FAResponse {
+                    debugLog("[SideSign] phone 2FA (\(mode.rawValue)) refused — falling back to devices")
                     pendingError = phoneMsg
                     state = .needsDevice2FA
+                } catch {
+                    debugLog("[SideSign] phone 2FA (\(mode.rawValue)) failed: \(error)")
+                    throw error
                 }
 
             case .needsDevice2FAVerification:
@@ -833,17 +803,9 @@ public extension DeveloperPortal {
                 case .requestTrustedDevice:
                     state = .needsDevice2FA
                 case .requestSMS(let id):
-                    state = .needsSMS2FA(phoneID: id)
+                    state = .needsPhone2FA(phoneID: id, mode: .sms)
                 case .requestVoice(let id):
-                    do {
-                        let result = try await sendPhone2FACodeRequest(
-                            mode: "voice", phoneID: id, knownPhoneNumbers: phoneNumbers, context: ctx)
-                        phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
-                        state = .needsSMS2FAVerification(phoneID: result.phoneID)
-                    } catch {
-                        pendingError = phoneMsg
-                        state = .needsDevice2FA
-                    }
+                    state = .needsPhone2FA(phoneID: id, mode: .voice)
                 case .verificationCode(let code):
                     let refreshed = await Self.refreshOTPKeepingMachine(
                         ctx.anisetteData, lockedCI: ctx.lockedClientInfo, lockedUA: ctx.lockedUserAgent)
@@ -860,6 +822,7 @@ public extension DeveloperPortal {
                             state = .needsDevice2FAVerification
                         }
                     } catch {
+                        debugLog("[SideSign] device 2FA verify error: \(error)")
                         pendingError = Self.sanitize2FAUserMessage("\(error)")
                         state = .needsDevice2FAVerification
                     }
@@ -867,26 +830,21 @@ public extension DeveloperPortal {
                     throw DeveloperPortalError.userCancelled
                 }
 
-            case .needsSMS2FAVerification(let phoneID):
+            case .needsPhone2FAVerification(let phoneID, let mode):
                 let err = pendingError
                 pendingError = nil
-                let response = try await verificationHandler(
-                    .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: err))
+                // 发码渠道与提示渠道、验证渠道保持一致（语音码不能按短信验证）。
+                let request: TwoFactorRequest = mode == .voice
+                    ? .voice(phoneNumbers: phoneNumbers, activeID: phoneID, error: err)
+                    : .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: err)
+                let response = try await verificationHandler(request)
                 switch response {
                 case .requestTrustedDevice:
                     state = .needsDevice2FA
                 case .requestSMS(let id):
-                    state = .needsSMS2FA(phoneID: id)
+                    state = .needsPhone2FA(phoneID: id, mode: .sms)
                 case .requestVoice(let id):
-                    do {
-                        let result = try await sendPhone2FACodeRequest(
-                            mode: "voice", phoneID: id, knownPhoneNumbers: phoneNumbers, context: ctx)
-                        phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
-                        state = .needsSMS2FAVerification(phoneID: result.phoneID)
-                    } catch {
-                        pendingError = phoneMsg
-                        state = .needsDevice2FA
-                    }
+                    state = .needsPhone2FA(phoneID: id, mode: .voice)
                 case .verificationCode(let code):
                     let refreshed = await Self.refreshOTPKeepingMachine(
                         ctx.anisetteData, lockedCI: ctx.lockedClientInfo, lockedUA: ctx.lockedUserAgent)
@@ -896,7 +854,7 @@ public extension DeveloperPortal {
                         lockedClientInfo: ctx.lockedClientInfo, lockedUserAgent: ctx.lockedUserAgent)
                     do {
                         switch try await validatePhone2FACode(
-                            code: code, phoneID: phoneID, mode: "sms", context: ctx) {
+                            code: code, phoneID: phoneID, mode: mode.rawValue, context: ctx) {
                         case .success:
                             return
                         case .retry(let message):
@@ -905,13 +863,16 @@ public extension DeveloperPortal {
                                 state = .needsDevice2FA
                             } else {
                                 pendingError = Self.sanitize2FAUserMessage(message)
-                                state = .needsSMS2FAVerification(phoneID: phoneID)
+                                state = .needsPhone2FAVerification(phoneID: phoneID, mode: mode)
                             }
                         }
-                    } catch {
-                        debugLog("[SideSign] SI SMS verify error → NeedsDevice2FA: \(error)")
+                    } catch DeveloperPortalError.invalid2FAResponse {
+                        debugLog("[SideSign] phone 2FA verify refused (\(mode.rawValue))")
                         pendingError = phoneMsg
                         state = .needsDevice2FA
+                    } catch {
+                        debugLog("[SideSign] phone 2FA verify error (\(mode.rawValue)): \(error)")
+                        throw error
                     }
                 case .cancel:
                     throw DeveloperPortalError.userCancelled
@@ -924,7 +885,7 @@ public extension DeveloperPortal {
         debugLog("[SideSign] Requesting trusted device 2FA code...")
         verboseLog("[SideSign] sendTrustedDevice2FACodeRequest for dsid: \(context.dsid)")
 
-        var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context, asMac: false)
+        var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context)
         request.httpMethod = "GET"
 
         if let allHeaders = request.allHTTPHeaderFields {
@@ -932,7 +893,7 @@ public extension DeveloperPortal {
         }
 
         do {
-            let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendTrustedDevice2FACodeRequest")
+            let (data, httpResponse) = try await performTwoFactorRequest(request, actionName: "sendTrustedDevice2FACodeRequest")
             let statusCode = httpResponse.safeStatusCode
             let rawPreview = String(data: data, encoding: .utf8) ?? ""
             // SideInstaller DEVICE_CODE_UNCONFIRMED: never throw — always allow code entry
@@ -966,7 +927,7 @@ public extension DeveloperPortal {
 
         // SideInstaller: PUT JSON to https://gsa.apple.com/auth/verify/phone
         let phoneURL = URL(string: "https://gsa.apple.com/auth/verify/phone")!
-        var request = makeTwoFactorAuthRequest(url: phoneURL, context: context, asMac: false)
+        var request = makeTwoFactorAuthRequest(url: phoneURL, context: context)
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -982,36 +943,37 @@ public extension DeveloperPortal {
             verboseLog("[SideSign] sendPhone2FACodeRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendPhone2FACodeRequest")
+        let (data, httpResponse) = try await performTwoFactorRequest(request, actionName: "sendPhone2FACodeRequest")
         let statusCode = httpResponse.safeStatusCode
 
         let rawStr = prettyJSONString(from: data)
         verboseLog("[SideSign] sendPhone2FACodeRequest raw response (HTTP \(statusCode)): \(rawStr)")
 
-        // SideInstaller PHONE_CODE_REFUSED: Apple returns "Could not connect to iCloud" / bare 403
-        // on Mac-ADI phone 2FA. Surface a consistent error so handle2FA falls back to devices.
+        // 仅把 Apple 明确拒绝"电话/语音投递"的响应归类为渠道被拒；
+        // 5xx、网关错误、解析失败等保留真实原因，避免全部伪装成"Apple 不发短信"。
         let (xmluiTitle, xmluiMessage) = parseXMLUIAlertMessage(from: data)
         let alertCombined = [xmluiTitle, xmluiMessage]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: ": ")
         let alertLower = alertCombined.lowercased()
-        if statusCode == 403 || statusCode == 503 || statusCode == 423 || statusCode == 401
+        let refused = statusCode == 401 || statusCode == 403 || statusCode == 423
             || alertLower.contains("icloud")
             || alertLower.contains("could not connect")
             || alertLower.contains("forbidden")
-        {
-            let msg = xmluiMessage ?? alertCombined
-            if !msg.isEmpty {
-                debugLog("[SideSign] sendPhone2FACodeRequest Apple refused phone code (HTTP \(statusCode)): \(msg)")
+        if refused {
+            if !alertCombined.isEmpty {
+                debugLog("[SideSign] sendPhone2FACodeRequest Apple refused phone code (HTTP \(statusCode)): \(alertCombined)")
             } else {
-                debugLog("[SideSign] sendPhone2FACodeRequest bare HTTP 403 — phone code refused")
+                debugLog("[SideSign] sendPhone2FACodeRequest refused (HTTP \(statusCode), empty body)")
             }
-            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
+            throw DeveloperPortalError.invalid2FAResponse(
+                cause: alertCombined.isEmpty ? nil : Self.sanitize2FAUserMessage(alertCombined))
         }
-        if xmluiTitle != nil || xmluiMessage != nil {
+        if (xmluiTitle != nil || xmluiMessage != nil), statusCode == HTTPStatusCodes.ok {
             debugLog("[SideSign] sendPhone2FACodeRequest alert from Apple (HTTP \(statusCode)): \(alertCombined)")
-            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
+            throw DeveloperPortalError.invalid2FAResponse(
+                cause: alertCombined.isEmpty ? nil : Self.sanitize2FAUserMessage(alertCombined))
         }
 
         let responseDict = parsePlistOrJSON(data)
@@ -1023,7 +985,7 @@ public extension DeveloperPortal {
         let emLower = (errorMsg ?? "").lowercased()
         if emLower.contains("icloud") || emLower.contains("could not connect") {
             debugLog("[SideSign] sendPhone2FACodeRequest service error iCloud refuse: \(errorMsg ?? "")")
-            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
+            throw DeveloperPortalError.invalid2FAResponse(cause: Self.sanitize2FAUserMessage(errorMsg))
         }
 
         if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
@@ -1043,13 +1005,10 @@ public extension DeveloperPortal {
         guard statusCode == HTTPStatusCodes.ok else {
             let reason = errorMsg ?? HTTPStatusCodes.localizedDescription(for: statusCode)
             debugLog("[SideSign] sendPhone2FACodeRequest failed (HTTP \(statusCode)): \(reason)")
-            // 403 already handled above; any other non-OK still try to soft-signal iCloud-style refusals
-            // 423 Locked = phone method locked (same as SideInstaller PHONE_CODE_REFUSED)
-            if statusCode == 403 || statusCode == 401 || statusCode == 423 {
-                throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
-            }
-            // Any non-OK phone response → treat as phone refused so UI falls back to devices
-            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
+            // 真实失败原因（5xx / 网关 / 其他）不再伪装成电话被拒
+            throw ServerError.badServerResponse(
+                reason: "Phone 2FA request failed (HTTP \(statusCode)): \(reason)",
+                jsonPayload: rawStr)
         }
 
         var parsedNumbers = parseTrustedPhoneNumbers(from: responseDict)
@@ -1098,7 +1057,7 @@ public extension DeveloperPortal {
     }
 
     private func validateTrustedDevice2FACode(code: String, context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context, asMac: false)
+        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context)
         verifyRequest.setValue(code, forHTTPHeaderField: "security-code")
 
         if let allHeaders = verifyRequest.allHTTPHeaderFields {
@@ -1106,7 +1065,7 @@ public extension DeveloperPortal {
         }
 
         debugLog("[SideSign] Verifying trusted device security code...")
-        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validate2FACode")
+        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, actionName: "validate2FACode")
         let verifyStatusCode = verifyHttpResponse.safeStatusCode
 
         return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: false, httpResponse: verifyHttpResponse)
@@ -1135,7 +1094,7 @@ public extension DeveloperPortal {
 
         // SideInstaller verify_sms_2fa — exact JSON POST
         let securityCodeURL = URL(string: "https://gsa.apple.com/auth/verify/phone/securitycode")!
-        var verifyRequest = makeTwoFactorAuthRequest(url: securityCodeURL, context: ctx, asMac: false)
+        var verifyRequest = makeTwoFactorAuthRequest(url: securityCodeURL, context: ctx)
         verifyRequest.httpMethod = "POST"
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -1152,7 +1111,7 @@ public extension DeveloperPortal {
         }
 
         debugLog("[SideSign] Verifying phone security code (SideInstaller JSON)...")
-        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: ctx, actionName: "validatePhone2FACode")
+        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, actionName: "validatePhone2FACode")
         let verifyStatusCode = verifyHttpResponse.safeStatusCode
         // SideInstaller: non-success → parse error; -21669 = wrong code → retry
         if verifyStatusCode == 503 || verifyStatusCode == 433 {
@@ -1162,7 +1121,7 @@ public extension DeveloperPortal {
             for (i, delay) in [UInt64(3_000_000_000), UInt64(8_000_000_000), UInt64(15_000_000_000)].enumerated() {
                 debugLog("[SideSign] Phone code submit HTTP \(lastStatus) — retry \(i + 1) after \(delay / 1_000_000_000)s")
                 try await Task.sleep(nanoseconds: delay)
-                let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, context: ctx, actionName: "validatePhone2FACode-retry")
+                let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, actionName: "validatePhone2FACode-retry")
                 lastData = retryData
                 lastStatus = retryHttp.safeStatusCode
                 lastHttp = retryHttp
@@ -1357,15 +1316,11 @@ public extension DeveloperPortal {
         AnisetteDataManager.shared.clearCache()
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
-        let forcedCI = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        let forcedUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-        _ = lockedCI
-        _ = lockedUA
 
         func stamp(_ data: AnisetteData) -> AnisetteData {
             var copy = data
-            copy.clientInfo = forcedCI
-            copy.userAgent = forcedUA
+            copy.clientInfo = lockedCI
+            copy.userAgent = lockedUA
             copy.clientTime = formatter.string(from: Date())
             return copy
         }
@@ -1394,8 +1349,8 @@ public extension DeveloperPortal {
 
         let identifier = UUID(uuidString: original.deviceID) ?? UUID()
         var requestHeaders = original.toRequestHeaders()
-        requestHeaders.clientInfo = forcedCI
-        requestHeaders.userAgent = forcedUA
+        requestHeaders.clientInfo = lockedCI
+        requestHeaders.userAgent = lockedUA
         requestHeaders.clientTime = formatter.string(from: Date())
 
         do {
@@ -1422,60 +1377,14 @@ public extension DeveloperPortal {
         }
     }
 
-    private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
-        // SideInstaller remote_v3::client_info_to_use — exact
-        let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
-        let windows = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
-        let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-        let akdUA = "akd/1.0 CFNetwork/808.1.4"
-
-        let stock = advertised.hasPrefix("<MacBookPro13,2> <macOS;13.1;22C65>")
-            || advertised.hasPrefix("<MacBookPro15,1> <Mac OS X;10.15.2;19C57>")
-        if advertised.isEmpty || stock || advertised.contains("<Android;") {
-            return (windows, akdUA)
-        }
-
-        // macOS version < 10.13 (Mac ADI) → CURRENT_MAC
-        if let ver = macOSVersion(fromClientInfo: advertised), ver.0 < 10 || (ver.0 == 10 && ver.1 < 13) {
-            return (currentMac, currentMacUA)
-        }
-        // If provider already stamped CURRENT_MAC (26.6), keep it
-        if advertised.contains("MacBookPro18,3") || advertised.contains("macOS;26.") {
-            return (currentMac, currentMacUA)
-        }
-        if advertised.contains("<PC>") || advertised.contains("Windows") {
-            return (windows, akdUA)
-        }
-        var ua = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
-        if ua.isEmpty { ua = akdUA }
-        return (advertised, ua)
-    }
-
-    private static func macOSVersion(fromClientInfo client: String) -> (Int, Int)? {
-        for marker in ["<macOS;", "<Mac OS X;"] {
-            guard let r = client.range(of: marker) else { continue }
-            let rest = client[r.upperBound...]
-            let end = rest.firstIndex(where: { $0 == ";" || $0 == ">" }) ?? rest.endIndex
-            let version = rest[..<end].trimmingCharacters(in: .whitespaces)
-            let parts = version.split(separator: ".").compactMap { Int($0) }
-            guard let major = parts.first else { return nil }
-            return (major, parts.count > 1 ? parts[1] : 0)
-        }
-        return nil
-    }
-
-
-    private static let macClientInfoFor2FA = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-
-    private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext, asMac: Bool = false) -> URLRequest {
+    private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext) -> URLRequest {
         // SideInstaller build_2fa_headers + send_auth base_headers (minimal set).
         // Extra headers (Client-Time, Locale, SRL-NO, buddyml Accept, etc.) correlate with HTTP 503.
         let identityToken = "\(context.dsid):\(context.idmsToken)"
         let encodedIdentityToken = Data(identityToken.utf8).base64EncodedString()
         let a = context.anisetteData
-        let clientInfo = asMac ? Self.macClientInfoFor2FA : context.lockedClientInfo
-        let ua = asMac ? "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)" : context.lockedUserAgent
+        let clientInfo = context.lockedClientInfo
+        let ua = context.lockedUserAgent
 
         var request = URLRequest(url: url)
         // Defaults match SideInstaller non-JSON auth pages; callers override for JSON phone.
@@ -1498,43 +1407,14 @@ public extension DeveloperPortal {
         return request
     }
 
-    private func performTwoFactorRequest(_ request: URLRequest, context: TwoFactorAuthContext, actionName: String) async throws -> (Data, HTTPURLResponse) {
-        var current = request
-        var triedMac = false
-        while true {
-            let (data, response) = try await dataWithFreshConnection(for: current)
-            let http = response as? HTTPURLResponse
-            let status = http?.safeStatusCode ?? 0
+    /// 身份已统一，不再做"切成另一台设备重试"的回退；只负责发出请求并保证拿到 HTTP 响应。
+    private func performTwoFactorRequest(_ request: URLRequest, actionName: String) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await dataWithFreshConnection(for: request)
+        guard let http = response as? HTTPURLResponse else {
             let body = String(data: data, encoding: .utf8) ?? ""
-
-            // SideInstaller refuses_client: only bare 403 (no serviceErrors), not 503
-            let hasServiceErrors = body.contains("serviceErrors") || body.contains("\"ec\"") || body.contains("\"ec\" :")
-            let bare403 = status == 403 && !hasServiceErrors
-            let shouldRetryAsMac = !triedMac && bare403
-            if shouldRetryAsMac {
-                debugLog("[SideSign] \(actionName) bare HTTP 403 — retrying as MAC_CLIENT_INFO (SideInstaller send_auth)")
-                guard let url = current.url else {
-                    throw ServerError.badServerResponse(reason: "\(actionName) missing URL", jsonPayload: body)
-                }
-                var macRequest = makeTwoFactorAuthRequest(url: url, context: context, asMac: true)
-                macRequest.httpMethod = current.httpMethod
-                macRequest.httpBody = current.httpBody
-                // Critical: phone securitycode is JSON — do not reset to text/x-xml-plist (→ HTTP 503)
-                if let ct = current.value(forHTTPHeaderField: "Content-Type") {
-                    macRequest.setValue(ct, forHTTPHeaderField: "Content-Type")
-                }
-                if let ac = current.value(forHTTPHeaderField: "Accept") {
-                    macRequest.setValue(ac, forHTTPHeaderField: "Accept")
-                }
-                current = macRequest
-                triedMac = true
-                continue
-            }
-            guard let http else {
-                throw ServerError.badServerResponse(reason: "\(actionName) non-HTTP response", jsonPayload: body)
-            }
-            return (data, http)
+            throw ServerError.badServerResponse(reason: "\(actionName) non-HTTP response", jsonPayload: body)
         }
+        return (data, http)
     }
 
 private func parsePlistOrJSON(_ data: Data) -> [String: any Sendable]? {

@@ -65,17 +65,16 @@ public enum DeveloperPortalError: Error, LocalizedError, Sendable {
         case .invalidAnisetteData(let cause):                   return "Invalid anisette data: \(cause)"
         case .tooManyCertificates(let cause):                   return "Maximum number of certificates reached: \(cause)"
         case .accountRepairRequired(_, let message):            return message.isEmpty ? Constants.defaultAccountRepairMessage : message
-                case .invalid2FAResponse(let cause):
-            // Never show Apple's "Could not connect to iCloud" (SideInstaller PHONE_CODE_REFUSED)
-            if let cause {
+        case .invalid2FAResponse(let cause):
+            // 只在 Apple 确实返回 iCloud 连接类文案时改写，其余保留原始信息便于排障
+            if let cause, !cause.isEmpty {
                 let lower = cause.lowercased()
-                if lower.contains("icloud") || lower.contains("could not connect") || cause == "PHONE_CODE_REFUSED" {
+                if lower.contains("icloud") || lower.contains("could not connect") {
                     return "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
                 }
                 return cause
             }
             return "Invalid two-factor authentication response."
-
         }
     }
 }
