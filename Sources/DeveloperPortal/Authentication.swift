@@ -1288,25 +1288,17 @@ public extension DeveloperPortal {
             return copy
         }
 
-        let adiB64 = UserDefaults.standard.string(forKey: "SideSign.anisetteAdiBlob")
-            ?? UserDefaults.standard.string(forKey: "anisetteAdiBlob")
-        let adiBlob = adiB64.flatMap { Data(base64Encoded: $0) }
+        // 机器身份由宿主注入的安全存储提供（Keychain 等），不读宿主 UserDefaults。
+        let adiBlob = AnisetteDataManager.shared.identityStorage?.loadAdiBlob()
 
         // No saved identity → keep machine + OTP from password step (SideInstaller always has state)
         guard let adiBlob, !adiBlob.isEmpty else {
-            debugLog("[SideSign] No adi.pb for OTP refresh — keeping same machine/OTP, new clientTime only")
+            debugLog("[SideSign] No stored adi.pb for OTP refresh — keeping same machine/OTP, new clientTime only")
             return stamp(original)
         }
 
-        let mode: AnisetteMode? = AnisetteDataManager.shared.activeMode ?? {
-            let urlStr = UserDefaults.standard.string(forKey: "menuAnisetteURL")
-                ?? UserDefaults.standard.string(forKey: "defaultServerURL")
-                ?? ""
-            guard let url = URL(string: urlStr), !urlStr.isEmpty else { return nil }
-            return .remote(server: url)
-        }()
-
-        guard let mode else {
+        // 服务器模式由宿主通过 AnisetteDataManager.activeMode 配置，不再窥探宿主偏好项。
+        guard let mode = AnisetteDataManager.shared.activeMode else {
             return stamp(original)
         }
 
@@ -1324,7 +1316,7 @@ public extension DeveloperPortal {
                 headers: requestHeaders
             )
             if let newBlob {
-                UserDefaults.standard.set(newBlob.base64EncodedString(), forKey: "SideSign.anisetteAdiBlob")
+                AnisetteDataManager.shared.identityStorage?.saveAdiBlob(newBlob)
             }
             // Accept full fresh headers for THIS adi only (SideInstaller get_headers)
             var result = stamp(fresh)

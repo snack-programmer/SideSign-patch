@@ -240,6 +240,9 @@ public final class AnisetteDataManager: @unchecked Sendable {
     }
 
     public var activeMode: AnisetteMode?
+
+    /// 宿主注入的机器身份存储（Keychain 等）。为空时 SideSign 不会持久化 adi.pb。
+    public var identityStorage: (any AnisetteIdentityStorage)?
     public let baseAnisetteDirectory: URL
     private var localProvider: AnisetteClient?
     private var isCaching: Bool = false
