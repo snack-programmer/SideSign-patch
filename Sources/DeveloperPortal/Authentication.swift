@@ -9,14 +9,20 @@
 import Foundation
 import GSACryptoKit
 
-private enum PushedCodeState {
-    @TaskLocal static var handled = false
+/// 一次登录过程中需要跨递归调用传递的显式状态（替代原 TaskLocal 隐式状态）。
+private struct AuthenticationProgress: Sendable {
+    var pushedCodeHandled = false
+    var twoFactorRounds = 0
 }
 
-/// SideInstaller: after any 2FA succeeds, login again must not re-enter SMS/device flow
-/// with a different machine identity (that yields GrandSlam HTTP 503).
-private enum Completed2FAState {
-    @TaskLocal static var completed = false
+/// GSA 返回的可重试状态（429/503/433）。用类型判断，而不是匹配错误文案。
+private struct RetryableHTTPError: LocalizedError {
+    let status: Int
+    let payload: String
+
+    var errorDescription: String? {
+        "Apple returned HTTP \(status) during sign-in. Please wait a moment and try again."
+    }
 }
 
 public extension DeveloperPortal {
@@ -28,6 +34,27 @@ public extension DeveloperPortal {
                       machinePassword: String? = nil,
                       accountRepairHandler: DeveloperPortal.AccountRepairHandler = DeveloperPortal.defaultAccountRepairHandler,
                       verificationHandler: DeveloperPortal.VerificationHandler? = nil) async throws -> AuthSession
+    {
+        try await authenticate(
+            appleID: unsanitizedAppleID,
+            password: password,
+            anisetteData: anisetteData,
+            xcodeVersion: xcodeVersion,
+            machinePassword: machinePassword,
+            accountRepairHandler: accountRepairHandler,
+            verificationHandler: verificationHandler,
+            progress: AuthenticationProgress()
+        )
+    }
+
+    private func authenticate(appleID unsanitizedAppleID: String,
+                              password: String,
+                              anisetteData: AnisetteData,
+                              xcodeVersion: String,
+                              machinePassword: String?,
+                              accountRepairHandler: DeveloperPortal.AccountRepairHandler,
+                              verificationHandler: DeveloperPortal.VerificationHandler?,
+                              progress: AuthenticationProgress) async throws -> AuthSession
     {
         let sanitizedAppleID = unsanitizedAppleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         debugLog("[SideSign] Starting authenticate...")
@@ -217,18 +244,19 @@ public extension DeveloperPortal {
         switch authType {
             case "trustedDeviceSecondaryAuth", "trustedDevice", "secondaryAuth", "sms", "voice", "phone", "pushedCode":
                 let pushedCode = authType == "pushedCode"
-                guard !pushedCode || !PushedCodeState.handled else {
+                guard !pushedCode || !progress.pushedCodeHandled else {
                     throw DeveloperPortalError.requiresTwoFactorAuthentication
                 }
-                // Already finished 2FA this sign-in — Apple asking again usually means
-                // anisette identity changed (new adi). Do not open SMS again.
-                if Completed2FAState.completed {
-                    debugLog("[SideSign] Apple requested 2FA again after completion (HTTP path) — refusing re-entry")
-                    throw ServerError.badServerResponse(
-                        reason: "Apple asked for 2FA again after the code was accepted (anisette identity mismatch). Reset adi.pb and sign in once.",
-                        jsonPayload: authType ?? ""
-                    )
+                // 最多允许两轮 2FA（首轮 + 重登后 Apple 再要求一次），避免无限循环。
+                guard progress.twoFactorRounds < 2 else {
+                    debugLog("[SideSign] Apple requested 2FA \(progress.twoFactorRounds + 1) times — aborting")
+                    throw DeveloperPortalError.tooManyAttempts(
+                        cause: "Apple asked for another verification code after a successful round. Please wait a moment and try signing in again.")
                 }
+                var nextProgress = progress
+                nextProgress.twoFactorRounds += 1
+                if pushedCode { nextProgress.pushedCodeHandled = true }
+
                 let isTrustedDevice = pushedCode || authType == "trustedDeviceSecondaryAuth" || authType == "trustedDevice"
                 try await handle2FARequest(
                     isTrustedDevice: isTrustedDevice,
@@ -238,31 +266,19 @@ public extension DeveloperPortal {
                     verificationHandler: verificationHandler,
                     codeAlreadySent: pushedCode
                 )
-                                // SideInstaller: after 2FA, login again with the SAME anisette machine
-                // (same adi / MD-M / device). Only clientTime is refreshed.
-                // Fetching a new adi mid-session is what produces GrandSlam HTTP 503
-                // after the SMS code on every account.
-                let formatter = ISO8601DateFormatter()
-                formatter.formatOptions = [.withInternetDateTime]
+
+                // 2FA 后用同一身份重新登录；有限次退避，总时长不超过 60s。
                 let lockedCI = twoFactorAuthContext.lockedClientInfo
                 let lockedUA = twoFactorAuthContext.lockedUserAgent
-
-                try await Task.sleep(nanoseconds: 5_000_000_000) // SideInstaller: let Apple commit the SMS session
-
+                let post2FADelays: [UInt64] = [1_000_000_000, 3_000_000_000, 5_000_000_000]
+                let deadline = Date().addingTimeInterval(60)
                 var lastPost2FAError: Error?
-                let postDelays: [UInt64] = [
-                    3_000_000_000,
-                    8_000_000_000,
-                    15_000_000_000,
-                    30_000_000_000,
-                    45_000_000_000,
-                ]
-                for attempt in 0..<postDelays.count {
-                    if attempt > 0 {
-                        try await Task.sleep(nanoseconds: postDelays[attempt])
-                    }
 
-                    // SideInstaller get_anisette_data before login again (fresh OTP, same machine)
+                for (index, delay) in post2FADelays.enumerated() {
+                    try await Task.sleep(nanoseconds: delay)
+                    guard Date() < deadline else { break }
+
+                    // get_anisette_data before login again（刷新 OTP，保持同一台机器）
                     var post2FAAnisette = await Self.refreshOTPKeepingMachine(
                         anisetteData,
                         lockedCI: lockedCI,
@@ -270,39 +286,30 @@ public extension DeveloperPortal {
                     )
                     post2FAAnisette.clientInfo = lockedCI
                     post2FAAnisette.userAgent = lockedUA
-                    post2FAAnisette.clientTime = formatter.string(from: Date())
+                    post2FAAnisette.clientTime = Self.timestamp()
 
-                    debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1)/\(postDelays.count) same-identity client=\(lockedCI.prefix(48))...")
+                    debugLog("[SideSign] Post-2FA re-login attempt \(index + 1)/\(post2FADelays.count) same-identity client=\(lockedCI.prefix(48))...")
 
                     do {
-                        return try await Completed2FAState.$completed.withValue(true) {
-                            try await PushedCodeState.$handled.withValue(true) {
-                                try await authenticate(
-                                    appleID: unsanitizedAppleID,
-                                    password: password,
-                                    anisetteData: post2FAAnisette,
-                                    xcodeVersion: xcodeVersion,
-                                    machinePassword: machinePassword,
-                                    accountRepairHandler: accountRepairHandler,
-                                    verificationHandler: verificationHandler
-                                )
-                            }
-                        }
-                    } catch {
-                        let msg = "\(error)".lowercased()
-                        let is503 = msg.contains("503") || msg.contains("433")
-                        debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1) failed: \(error)")
-                        if is503, attempt < postDelays.count - 1 {
-                            lastPost2FAError = error
-                            continue
-                        }
-                        throw error
+                        return try await authenticate(
+                            appleID: unsanitizedAppleID,
+                            password: password,
+                            anisetteData: post2FAAnisette,
+                            xcodeVersion: xcodeVersion,
+                            machinePassword: machinePassword,
+                            accountRepairHandler: accountRepairHandler,
+                            verificationHandler: verificationHandler,
+                            progress: nextProgress
+                        )
+                    } catch let retryable as RetryableHTTPError {
+                        debugLog("[SideSign] Post-2FA re-login attempt \(index + 1) got HTTP \(retryable.status), retrying")
+                        lastPost2FAError = retryable
+                        continue
                     }
                 }
                 throw lastPost2FAError ?? ServerError.badServerResponse(
-                    reason: "Apple returned HTTP 503 after SMS. Same anisette identity was kept; wait and try once later.",
-                    jsonPayload: ""
-                )
+                    reason: "Apple rejected the sign-in after verification. Please wait a moment and try again.",
+                    jsonPayload: "")
 
             case "repair":
                 let directRepairURL = completeResponseDictionary["repairUrl"] as? String
@@ -418,14 +425,14 @@ public extension DeveloperPortal {
         }
 
         // SideInstaller: retry 429/503 时保持同一身份，仅做退避。
-        let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000]
+        let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000]
         var data = Data()
         var response: URLResponse = URLResponse(url: Constants.URLs.grandSlamAuth, mimeType: nil, expectedContentLength: 0, textEncodingName: nil)
         var statusCode = 0
         var attempt = 0
         while true {
             do {
-                (data, response) = try await dataWithFreshConnection(for: request)
+                (data, response) = try await session.data(for: request)
             } catch {
                 debugLog("[SideSign] sendAuthenticationRequest network error: \(error)")
                 throw error
@@ -443,13 +450,10 @@ public extension DeveloperPortal {
             break
         }
 
-        if statusCode == 503 || statusCode == 433 {
+        if statusCode == HTTPStatusCodes.tooManyRequests || statusCode == 503 || statusCode == 433 {
             let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
             debugLog("[SideSign] GrandSlam still HTTP \(statusCode) after retries: \(rawStr.prefix(200))")
-            throw ServerError.badServerResponse(
-                reason: "Apple returned HTTP \(statusCode) on sign-in (often rate-limit or bad anisette). Wait 15–30 minutes, Reset adi.pb, use Auto or a Mac server, try once.",
-                jsonPayload: rawStr
-            )
+            throw RetryableHTTPError(status: statusCode, payload: rawStr)
         }
 
         if statusCode != 0 && !(200...299).contains(statusCode) {
@@ -702,12 +706,6 @@ public extension DeveloperPortal {
         let statusCode: Int
     }
 
-    private enum TwoFactorAuthChannel {
-        case trustedDevice
-        case sms(phoneID: String)
-        case voice(phoneID: String)
-    }
-
     private enum TwoFactorAuthValidationResult {
         case success
         case retry(message: String)
@@ -741,6 +739,8 @@ public extension DeveloperPortal {
         let phoneID0 = phoneNumbers.first?.id ?? "1"
         var ctx = context
         var pendingError: String? = nil
+        var codeRequests = 0
+        var verificationAttempts = 0
 
         // SideStore only shows Apple Devices / SMS / Phone Call for
         // TwoFactorRequest.selectDeliveryMethod — not for .trustedDevice
@@ -780,6 +780,11 @@ public extension DeveloperPortal {
                 state = .needsDevice2FAVerification
 
             case .needsPhone2FA(let phoneID, let mode):
+                codeRequests += 1
+                guard codeRequests <= 5 else {
+                    throw DeveloperPortalError.tooManyAttempts(
+                        cause: "Too many verification codes requested for this sign-in. Please try again later.")
+                }
                 do {
                     let result = try await sendPhone2FACodeRequest(
                         mode: mode.rawValue, phoneID: phoneID, knownPhoneNumbers: phoneNumbers, context: ctx)
@@ -807,6 +812,11 @@ public extension DeveloperPortal {
                 case .requestVoice(let id):
                     state = .needsPhone2FA(phoneID: id, mode: .voice)
                 case .verificationCode(let code):
+                    verificationAttempts += 1
+                    guard verificationAttempts <= 5 else {
+                        throw DeveloperPortalError.tooManyAttempts(
+                            cause: "Too many verification codes entered for this sign-in. Please try again later.")
+                    }
                     let refreshed = await Self.refreshOTPKeepingMachine(
                         ctx.anisetteData, lockedCI: ctx.lockedClientInfo, lockedUA: ctx.lockedUserAgent)
                     ctx = TwoFactorAuthContext(
@@ -846,6 +856,11 @@ public extension DeveloperPortal {
                 case .requestVoice(let id):
                     state = .needsPhone2FA(phoneID: id, mode: .voice)
                 case .verificationCode(let code):
+                    verificationAttempts += 1
+                    guard verificationAttempts <= 5 else {
+                        throw DeveloperPortalError.tooManyAttempts(
+                            cause: "Too many verification codes entered for this sign-in. Please try again later.")
+                    }
                     let refreshed = await Self.refreshOTPKeepingMachine(
                         ctx.anisetteData, lockedCI: ctx.lockedClientInfo, lockedUA: ctx.lockedUserAgent)
                     ctx = TwoFactorAuthContext(
@@ -905,6 +920,12 @@ public extension DeveloperPortal {
             } else {
                 debugLog("[SideSign] Trusted-device code request accepted")
             }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let urlError as URLError {
+            // 传输层失败不应被当作"已发码"，否则用户会对着不会到达的验证码等待
+            debugLog("[SideSign] Trusted-device request transport error: \(urlError)")
+            throw urlError
         } catch {
             debugLog("[SideSign] Trusted-device request error soft-fail: \(error)")
         }
@@ -931,8 +952,18 @@ public extension DeveloperPortal {
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        // SideInstaller uses numeric phone id (u32); default 1
-        let phoneIdValue: Int = Int(sanitizedPhoneID) ?? 1
+        // Apple 的 phone id 是数字；非数字时按已知号码列表索引映射，映射不到则明确报错，
+        // 不能静默回退到 1 号号码。
+        let phoneIdValue: Int
+        if let parsed = Int(sanitizedPhoneID) {
+            phoneIdValue = parsed
+        } else if let index = knownPhoneNumbers.firstIndex(where: {
+            $0.id.trimmingCharacters(in: .whitespacesAndNewlines) == sanitizedPhoneID
+        }) {
+            phoneIdValue = index + 1
+        } else {
+            throw DeveloperPortalError.invalidParameters(cause: "Unsupported phone id: \(sanitizedPhoneID)")
+        }
         let jsonBody: [String: Any] = [
             "phoneNumber": ["id": phoneIdValue],
             "mode": requestedMode
@@ -1098,7 +1129,9 @@ public extension DeveloperPortal {
         verifyRequest.httpMethod = "POST"
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Accept")
-        let phoneIdValue: Int = Int(phoneID) ?? 1
+        guard let phoneIdValue = Int(phoneID) else {
+            throw DeveloperPortalError.invalidParameters(cause: "Unsupported phone id: \(phoneID)")
+        }
         let jsonBody: [String: Any] = [
             "securityCode": ["code": code],
             "phoneNumber": ["id": phoneIdValue],
@@ -1118,7 +1151,7 @@ public extension DeveloperPortal {
             var lastData = verifyData
             var lastStatus = verifyStatusCode
             var lastHttp = verifyHttpResponse
-            for (i, delay) in [UInt64(3_000_000_000), UInt64(8_000_000_000), UInt64(15_000_000_000)].enumerated() {
+            for (i, delay) in [UInt64(2_000_000_000), UInt64(5_000_000_000), UInt64(10_000_000_000)].enumerated() {
                 debugLog("[SideSign] Phone code submit HTTP \(lastStatus) — retry \(i + 1) after \(delay / 1_000_000_000)s")
                 try await Task.sleep(nanoseconds: delay)
                 let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, actionName: "validatePhone2FACode-retry")
@@ -1226,87 +1259,17 @@ public extension DeveloperPortal {
         return .success
     }
 
-    /// SideInstaller MAC_CLIENT_INFO: gsa.apple.com/auth 2FA pages often return a bare 403
-    /// for the Windows client used on GrandSlam; retry those requests as a Mac.
 
-    /// SideInstaller client_info_to_use — one identity for the whole sign-in.
     
-    /// SideInstaller calls `get_anisette_data` again before "login again" after 2FA.
-    /// Fresh OTP (X-Apple-I-MD) avoids GrandSlam HTTP 503 on the post-code SRP.
-    private static func refreshAnisetteAfter2FA(
-        original: AnisetteData,
-        lockedClientInfo: String,
-        lockedUserAgent: String
-    ) async -> AnisetteData {
-        AnisetteDataManager.shared.clearCache()
+    /// 认证相关请求统一走 DeveloperPortal 的 session；连接不复用由请求头
+    /// `Connection: close` 控制，无需为每次请求新建 URLSession。
+
+
+    private static func timestamp() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
-
-        // Prefer activeMode; else SideStore's menuAnisetteURL (UserDefaults)
-        let mode: AnisetteMode? = AnisetteDataManager.shared.activeMode ?? {
-            let urlStr = UserDefaults.standard.string(forKey: "menuAnisetteURL")
-                ?? UserDefaults.standard.string(forKey: "defaultServerURL")
-                ?? ""
-            guard let url = URL(string: urlStr), !urlStr.isEmpty else { return nil }
-            return .remote(server: url)
-        }()
-
-        guard let mode else {
-            debugLog("[SideSign] Post-2FA anisette refresh: no server mode — keeping OTP, fresh clientTime only")
-            var copy = original
-            copy.clientInfo = lockedClientInfo
-            copy.userAgent = lockedUserAgent
-            copy.clientTime = formatter.string(from: Date())
-            return copy
-        }
-
-        let identifier = UUID(uuidString: original.deviceID) ?? UUID()
-        var requestHeaders = original.toRequestHeaders()
-        requestHeaders.clientInfo = lockedClientInfo
-        requestHeaders.userAgent = lockedUserAgent
-        requestHeaders.clientTime = formatter.string(from: Date())
-
-        do {
-            let (fresh, _) = try await AnisetteDataManager.shared.fetchAnisetteData(
-                mode: mode,
-                identifier: identifier,
-                existingAdiBlob: nil,
-                headers: requestHeaders
-            )
-            var result = fresh
-            result.clientInfo = lockedClientInfo
-            result.userAgent = lockedUserAgent
-            result.clientTime = formatter.string(from: Date())
-            if result.deviceID.isEmpty { result.deviceID = original.deviceID }
-            if result.machineID.isEmpty { result.machineID = original.machineID }
-            debugLog("[SideSign] Post-2FA anisette refresh OK (new OTP)")
-            return result
-        } catch {
-            debugLog("[SideSign] Post-2FA anisette refresh failed (\(error)); using prior headers + new clientTime")
-            var copy = original
-            copy.clientInfo = lockedClientInfo
-            copy.userAgent = lockedUserAgent
-            copy.clientTime = formatter.string(from: Date())
-            return copy
-        }
+        return formatter.string(from: Date())
     }
-
-
-    
-    /// SideInstaller uses a fresh TCP connection per GSA request (pool_max_idle_per_host = 0).
-    /// Reused HTTP/2 connections are a known source of GrandSlam HTTP 503.
-    private func dataWithFreshConnection(for request: URLRequest) async throws -> (Data, URLResponse) {
-        let config = URLSessionConfiguration.ephemeral
-        config.httpShouldUsePipelining = false
-        config.httpMaximumConnectionsPerHost = 1
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 90
-        let ephemeral = URLSession(configuration: config)
-        defer { ephemeral.invalidateAndCancel() }
-        return try await ephemeral.data(for: request)
-    }
-
 
     /// SideInstaller refreshes anisette before verify_sms and before login again (OTP ~60s).
     /// Same machine (adi / MD-M) when possible; new X-Apple-I-MD only.
@@ -1409,7 +1372,7 @@ public extension DeveloperPortal {
 
     /// 身份已统一，不再做"切成另一台设备重试"的回退；只负责发出请求并保证拿到 HTTP 响应。
     private func performTwoFactorRequest(_ request: URLRequest, actionName: String) async throws -> (Data, HTTPURLResponse) {
-        let (data, response) = try await dataWithFreshConnection(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw ServerError.badServerResponse(reason: "\(actionName) non-HTTP response", jsonPayload: body)

@@ -260,7 +260,7 @@ public final class DeveloperPortal: DeveloperPortalAPI, Sendable {
     private static func makeGSASession() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldUsePipelining = false
-        config.httpMaximumConnectionsPerHost = 1
+        config.httpMaximumConnectionsPerHost = 4
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.urlCache = nil
         config.timeoutIntervalForRequest = 60

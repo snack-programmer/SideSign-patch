@@ -15,13 +15,13 @@ public enum Constants {
         public static let service        = "iCloud"
         public static let headerVersion  = "1.0.1"
         public static let authApp        = "com.apple.gs.xcode.auth"
-        public static let userAgent      = "akd/1.0 CFNetwork/808.1.4"  // SideInstaller temporary Windows GSA fix
+        public static let userAgent      = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)"
     }
 
     // https://idmsa.apple.com/appleauth/auth/devices
     public enum AppleAuth {
         public static let appIDKey   = "ba2ec180e6ca6e6c6a542255453b24d6e6e5b2be0cc48bc1b0d8ad64cfe0228f"
-        public static let userAgent  = "akd/1.0 CFNetwork/808.1.4"  // SideInstaller temporary Windows GSA fix
+        public static let userAgent  = "AuthKit/1 (Macintosh; OS X 26.6)"
     }
 
     // https://developerservices2.apple.com/services/
