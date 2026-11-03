@@ -248,7 +248,7 @@ public extension DeveloperPortal {
                     throw DeveloperPortalError.requiresTwoFactorAuthentication
                 }
                 // 最多允许两轮 2FA（首轮 + 重登后 Apple 再要求一次），避免无限循环。
-                guard progress.twoFactorRounds < 2 else {
+                guard TwoFactorFlow.canStartRound(progress.twoFactorRounds) else {
                     debugLog("[SideSign] Apple requested 2FA \(progress.twoFactorRounds + 1) times — aborting")
                     throw DeveloperPortalError.tooManyAttempts(
                         cause: "Apple asked for another verification code after a successful round. Please wait a moment and try signing in again.")
@@ -439,7 +439,7 @@ public extension DeveloperPortal {
             }
             let httpResponse = response as? HTTPURLResponse
             statusCode = httpResponse?.statusCode ?? 0
-            let retryable = statusCode == HTTPStatusCodes.tooManyRequests || statusCode == 503 || statusCode == 433
+            let retryable = TwoFactorFlow.isRetryable(status: statusCode)
             if retryable, attempt < retryDelays.count {
                 let delay = retryDelays[attempt]
                 debugLog("[SideSign] GrandSlam HTTP \(statusCode) — retry \(attempt + 1) in \(delay / 1_000_000_000)s client=\(clientInfo.prefix(40))...")
@@ -450,7 +450,7 @@ public extension DeveloperPortal {
             break
         }
 
-        if statusCode == HTTPStatusCodes.tooManyRequests || statusCode == 503 || statusCode == 433 {
+        if TwoFactorFlow.isRetryable(status: statusCode) {
             let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
             debugLog("[SideSign] GrandSlam still HTTP \(statusCode) after retries: \(rawStr.prefix(200))")
             throw RetryableHTTPError(status: statusCode, payload: rawStr)
@@ -844,9 +844,11 @@ public extension DeveloperPortal {
                 let err = pendingError
                 pendingError = nil
                 // 发码渠道与提示渠道、验证渠道保持一致（语音码不能按短信验证）。
-                let request: TwoFactorRequest = mode == .voice
-                    ? .voice(phoneNumbers: phoneNumbers, activeID: phoneID, error: err)
-                    : .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: err)
+                let request = TwoFactorFlow.verificationRequest(
+                    mode: mode,
+                    phoneNumbers: phoneNumbers,
+                    activeID: phoneID,
+                    error: err)
                 let response = try await verificationHandler(request)
                 switch response {
                 case .requestTrustedDevice:
@@ -954,16 +956,7 @@ public extension DeveloperPortal {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         // Apple 的 phone id 是数字；非数字时按已知号码列表索引映射，映射不到则明确报错，
         // 不能静默回退到 1 号号码。
-        let phoneIdValue: Int
-        if let parsed = Int(sanitizedPhoneID) {
-            phoneIdValue = parsed
-        } else if let index = knownPhoneNumbers.firstIndex(where: {
-            $0.id.trimmingCharacters(in: .whitespacesAndNewlines) == sanitizedPhoneID
-        }) {
-            phoneIdValue = index + 1
-        } else {
-            throw DeveloperPortalError.invalidParameters(cause: "Unsupported phone id: \(sanitizedPhoneID)")
-        }
+        let phoneIdValue = try TwoFactorFlow.numericPhoneID(sanitizedPhoneID, known: knownPhoneNumbers)
         let jsonBody: [String: Any] = [
             "phoneNumber": ["id": phoneIdValue],
             "mode": requestedMode
@@ -987,11 +980,8 @@ public extension DeveloperPortal {
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: ": ")
-        let alertLower = alertCombined.lowercased()
-        let refused = statusCode == 401 || statusCode == 403 || statusCode == 423
-            || alertLower.contains("icloud")
-            || alertLower.contains("could not connect")
-            || alertLower.contains("forbidden")
+        let refused = TwoFactorFlow.isPhoneRefusal(
+            status: statusCode, title: xmluiTitle, message: xmluiMessage)
         if refused {
             if !alertCombined.isEmpty {
                 debugLog("[SideSign] sendPhone2FACodeRequest Apple refused phone code (HTTP \(statusCode)): \(alertCombined)")
@@ -1147,7 +1137,7 @@ public extension DeveloperPortal {
         let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, actionName: "validatePhone2FACode")
         let verifyStatusCode = verifyHttpResponse.safeStatusCode
         // SideInstaller: non-success → parse error; -21669 = wrong code → retry
-        if verifyStatusCode == 503 || verifyStatusCode == 433 {
+        if TwoFactorFlow.isRetryable(status: verifyStatusCode) {
             var lastData = verifyData
             var lastStatus = verifyStatusCode
             var lastHttp = verifyHttpResponse
@@ -1158,7 +1148,7 @@ public extension DeveloperPortal {
                 lastData = retryData
                 lastStatus = retryHttp.safeStatusCode
                 lastHttp = retryHttp
-                if lastStatus != 503 && lastStatus != 433 { break }
+                if !TwoFactorFlow.isRetryable(status: lastStatus) { break }
             }
             // Last resort: same JSON body as Mac15,7 (SideInstaller MAC_CLIENT_INFO path)
             if lastStatus == 503 || lastStatus == 433 {
@@ -1260,7 +1250,7 @@ public extension DeveloperPortal {
     }
 
 
-    
+
     /// 认证相关请求统一走 DeveloperPortal 的 session；连接不复用由请求头
     /// `Connection: close` 控制，无需为每次请求新建 URLSession。
 

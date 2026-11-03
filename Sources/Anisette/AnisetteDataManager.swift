@@ -255,7 +255,7 @@ public final class AnisetteDataManager: @unchecked Sendable {
         let timestamp: Date
     }
     private var remoteCache: RemoteAnisetteCacheEntry?
-    
+
     public func clearCache() {
         remoteCache = nil
     }
@@ -429,7 +429,7 @@ public final class AnisetteDataManager: @unchecked Sendable {
             if let cache = remoteCache,
                cache.serverURL == serverURL,
                cache.identifier == identifier,
-               Date().timeIntervalSince(cache.timestamp) < Constants.Anisette.remoteCacheDuration 
+               Date().timeIntervalSince(cache.timestamp) < Constants.Anisette.remoteCacheDuration
             {
                 debugLog("[AnisetteDataManager] Reusing cached remote Anisette data for \(serverURL.absoluteString) (age: \(String(format: "%.1fs", Date().timeIntervalSince(cache.timestamp))))")
                 return (cache.data, cache.newAdiBlob)

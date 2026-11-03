@@ -24,5 +24,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  style:
+    name: Swift style (changed files)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Style check
+        run: scripts/ci/style-check --changed "origin/${{ github.base_ref }}"
+
   build:
     uses: ./.github/workflows/build-all.yml

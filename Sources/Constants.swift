@@ -32,7 +32,7 @@ public enum Constants {
         public static let userAgent               = "Xcode"
     }
 
-    public static let defaultAccountRepairMessage = "Your Apple ID requires account verification or terms agreement.\n" + 
+    public static let defaultAccountRepairMessage = "Your Apple ID requires account verification or terms agreement.\n" +
                                                     "Please sign in to developer.apple.com or appleid.apple.com."
 
     public enum URLs {

@@ -94,32 +94,32 @@ public extension DeveloperPortal {
 }
 
 public protocol DeveloperPortalAPI: Sendable {
-    func authenticate(appleID unsanitizedAppleID: String, 
-                      password: String, 
-                      anisetteData: AnisetteData, 
-                      xcodeVersion: String, 
-                      machinePassword: String?, 
+    func authenticate(appleID unsanitizedAppleID: String,
+                      password: String,
+                      anisetteData: AnisetteData,
+                      xcodeVersion: String,
+                      machinePassword: String?,
                       accountRepairHandler: DeveloperPortal.AccountRepairHandler,
                       verificationHandler: DeveloperPortal.VerificationHandler?) async throws -> AuthSession
 
     func fetchAccount(session: Session) async throws -> Account
     func fetchTeams(for account: Account, session: Session) async throws -> [Team]
-    
+
     func fetchCertificates(for team: Team, session: Session) async throws -> [X509Certificate]
     func addCertificate(machineName: String, type: CertificateType, to team: Team, session: Session) async throws -> KeyStore
     func revokeCertificate(_ certificate: X509Certificate, for team: Team, session: Session) async throws -> Bool
-    
+
     func fetchDevices(for team: Team, types: DeviceType, session: Session) async throws -> [Device]
     func registerDevice(name: String, identifier: String, type: DeviceType, team: Team, session: Session) async throws -> Device
     func updateDevice(_ device: Device, team: Team, session: Session) async throws -> Device
     func disableDevice(_ device: Device, team: Team, session: Session) async throws -> Device
     func deleteDevice(_ device: Device, team: Team, session: Session) async throws -> Bool
-    
+
     func fetchAppIDs(for team: Team, session: Session) async throws -> [AppID]
     func addAppID(withName name: String, bundleIdentifier: String, team: Team, session: Session) async throws -> AppID
     func updateAppID(_ appID: AppID, team: Team, session: Session) async throws -> AppID
     func deleteAppID(_ appID: AppID, for team: Team, session: Session) async throws -> Bool
-    
+
     func fetchAppGroups(for team: Team, session: Session) async throws -> [AppGroup]
     func addAppGroup(name: String, groupIdentifier: String, team: Team, session: Session) async throws -> AppGroup
     func updateAppGroup(_ appGroup: AppGroup, team: Team, session: Session) async throws -> AppGroup
@@ -138,49 +138,49 @@ public protocol DeveloperPortalAPI: Sendable {
 }
 
 public extension DeveloperPortalAPI {
-    func authenticate(appleID unsanitizedAppleID: String, 
-                      password: String, 
-                      anisetteData: AnisetteData, 
-                      xcodeVersion: String, 
-                      verificationHandler: DeveloperPortal.VerificationHandler? = nil) async throws -> AuthSession 
+    func authenticate(appleID unsanitizedAppleID: String,
+                      password: String,
+                      anisetteData: AnisetteData,
+                      xcodeVersion: String,
+                      verificationHandler: DeveloperPortal.VerificationHandler? = nil) async throws -> AuthSession
     {
         try await authenticate(
-            appleID: unsanitizedAppleID, password: password, 
-            anisetteData: anisetteData, xcodeVersion: xcodeVersion, 
-            machinePassword: nil, 
-            accountRepairHandler: DeveloperPortal.defaultAccountRepairHandler, 
+            appleID: unsanitizedAppleID, password: password,
+            anisetteData: anisetteData, xcodeVersion: xcodeVersion,
+            machinePassword: nil,
+            accountRepairHandler: DeveloperPortal.defaultAccountRepairHandler,
             verificationHandler: verificationHandler
         )
     }
 
-    func authenticate(appleID unsanitizedAppleID: String, 
-                      password: String, 
-                      anisetteData: AnisetteData, 
-                      xcodeVersion: String, 
-                      machinePassword: String?) async throws -> AuthSession 
+    func authenticate(appleID unsanitizedAppleID: String,
+                      password: String,
+                      anisetteData: AnisetteData,
+                      xcodeVersion: String,
+                      machinePassword: String?) async throws -> AuthSession
     {
         try await authenticate(
-            appleID: unsanitizedAppleID, password: password, 
-            anisetteData: anisetteData, xcodeVersion: xcodeVersion, 
-            machinePassword: machinePassword, 
-            accountRepairHandler: DeveloperPortal.defaultAccountRepairHandler, 
+            appleID: unsanitizedAppleID, password: password,
+            anisetteData: anisetteData, xcodeVersion: xcodeVersion,
+            machinePassword: machinePassword,
+            accountRepairHandler: DeveloperPortal.defaultAccountRepairHandler,
             verificationHandler: nil
         )
     }
 
-    func authenticate(appleID unsanitizedAppleID: String, 
-                      password: String, 
-                      anisetteData: AnisetteData, 
-                      xcodeVersion: String, 
+    func authenticate(appleID unsanitizedAppleID: String,
+                      password: String,
+                      anisetteData: AnisetteData,
+                      xcodeVersion: String,
                       machinePassword: String? = nil,
                       accountRepairHandler: DeveloperPortal.AccountRepairHandler,
-                      verificationHandler: DeveloperPortal.VerificationHandler? = nil) async throws -> AuthSession 
+                      verificationHandler: DeveloperPortal.VerificationHandler? = nil) async throws -> AuthSession
     {
         try await authenticate(
-            appleID: unsanitizedAppleID, password: password, 
-            anisetteData: anisetteData, xcodeVersion: xcodeVersion, 
-            machinePassword: machinePassword, 
-            accountRepairHandler: accountRepairHandler, 
+            appleID: unsanitizedAppleID, password: password,
+            anisetteData: anisetteData, xcodeVersion: xcodeVersion,
+            machinePassword: machinePassword,
+            accountRepairHandler: accountRepairHandler,
             verificationHandler: verificationHandler
         )
     }

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# 轻量 Swift 风格检查（无外部依赖）。
+# 只检查客观、可自动判定的规则，避免与既有 Xcode 对齐风格冲突：
+#   - CRLF 行尾
+#   - Tab 缩进
+#   - 行尾空白
+#   - 文件末尾缺少换行
+#   - 合并冲突标记
+#
+# 用法：
+#   scripts/ci/style-check.sh                 # 检查整个仓库
+#   scripts/ci/style-check.sh --changed BASE  # 只检查相对 BASE 改动的 .swift 文件
+#
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+
+MODE="all"
+BASE=""
+if [[ "${1:-}" == "--changed" ]]; then
+    MODE="changed"
+    BASE="${2:-}"
+    if [[ -z "$BASE" ]]; then
+        echo "usage: $0 --changed <git-base>" >&2
+        exit 2
+    fi
+fi
+
+collect_files() {
+    if [[ "$MODE" == "changed" ]]; then
+        git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- '*.swift' 2>/dev/null \
+            | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done
+    else
+        find . -name '*.swift' \
+            -not -path './.git/*' \
+            -not -path './.build/*' \
+            -not -path './Dependencies/*' \
+            -not -path './Pods/*' \
+            -print | sed 's|^\./||'
+    fi
+}
+
+failures=0
+checked=0
+
+while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    checked=$((checked + 1))
+
+    if LC_ALL=C grep -q $'\r' "$file"; then
+        echo "CRLF: $file"
+        failures=$((failures + 1))
+    fi
+
+    if grep -q $'\t' "$file"; then
+        line=$(grep -n $'\t' "$file" | head -n 1 | cut -d: -f1)
+        echo "TAB: $file:$line"
+        failures=$((failures + 1))
+    fi
+
+    if grep -nE '[[:blank:]]+$' "$file" >/dev/null 2>&1; then
+        line=$(grep -nE '[[:blank:]]+$' "$file" | head -n 1 | cut -d: -f1)
+        echo "TRAILING-WHITESPACE: $file:$line"
+        failures=$((failures + 1))
+    fi
+
+    if [[ -n "$(tail -c 1 "$file")" ]]; then
+        echo "NO-FINAL-NEWLINE: $file"
+        failures=$((failures + 1))
+    fi
+
+    if grep -nE '^(<<<<<<<|=======|>>>>>>>)' "$file" >/dev/null 2>&1; then
+        line=$(grep -nE '^(<<<<<<<|=======|>>>>>>>)' "$file" | head -n 1 | cut -d: -f1)
+        echo "CONFLICT-MARKER: $file:$line"
+        failures=$((failures + 1))
+    fi
+done < <(collect_files)
+
+echo "style-check: $checked file(s), $failures issue(s)"
+exit $(( failures > 0 ? 1 : 0 ))
