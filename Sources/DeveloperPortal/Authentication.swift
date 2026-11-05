@@ -1150,15 +1150,12 @@ public extension DeveloperPortal {
                 lastHttp = retryHttp
                 if !TwoFactorFlow.isRetryable(status: lastStatus) { break }
             }
-            // Last resort: same JSON body as Mac15,7 (SideInstaller MAC_CLIENT_INFO path)
-            if lastStatus == 503 || lastStatus == 433 {
-                debugLog("[SideSign] Phone code still HTTP \(lastStatus) — one attempt as MAC_CLIENT_INFO")
-                var macReq = makeTwoFactorAuthRequest(url: securityCodeURL, context: ctx, asMac: true)
-                macReq.httpMethod = "POST"
-                macReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                macReq.setValue("application/json", forHTTPHeaderField: "Accept")
-                macReq.httpBody = verifyRequest.httpBody
-                let (macData, macHttp) = try await performTwoFactorRequest(macReq, context: ctx, actionName: "validatePhone2FACode-mac")
+            // 最后一轮仍被 503/433 拒绝时，用 SideInstaller 的 Mac 身份再试一次。
+            // 只覆盖身份头，JSON body 与 Content-Type/Accept 全部保留；429 不换身份。
+            if TwoFactorFlow.shouldRetryAsMac(status: lastStatus) {
+                debugLog("[SideSign] Phone code still HTTP \(lastStatus) — one attempt with Mac identity")
+                let macRequest = TwoFactorFlow.applyingFallbackIdentity(to: verifyRequest)
+                let (macData, macHttp) = try await performTwoFactorRequest(macRequest, actionName: "validatePhone2FACode-mac")
                 lastData = macData
                 lastStatus = macHttp.safeStatusCode
                 lastHttp = macHttp

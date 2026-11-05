@@ -27,6 +27,26 @@ enum TwoFactorFlow {
         status == 429 || status == 433 || status == 503
     }
 
+    /// 退避重试仍被 503/433 拒绝时，才用 SideInstaller 的 Mac 身份做最后一次尝试。
+    /// 429 是限流，换身份无益且可能加重风控，因此不在此列。
+    static func shouldRetryAsMac(status: Int) -> Bool {
+        status == 503 || status == 433
+    }
+
+    /// SideInstaller `remote_v3::get_client_info`：公开 anisette 服务器仍可能返回
+    /// com.apple.dt.Xcode 客户端，GSA 会以 503 拒绝；回退时统一报 Mac15,7。
+    static let fallbackClientInfo = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+    static let fallbackUserAgent = "akd/1.0 CFNetwork/808.1.4"
+
+    /// 只替换身份头，保留调用方的 method/body/Content-Type/Accept。
+    /// 重建请求会丢掉 JSON 媒体类型，正是 2FA 验证失败的原因之一。
+    static func applyingFallbackIdentity(to request: URLRequest) -> URLRequest {
+        var copy = request
+        copy.setValue(fallbackClientInfo, forHTTPHeaderField: "X-Mme-Client-Info")
+        copy.setValue(fallbackUserAgent, forHTTPHeaderField: "User-Agent")
+        return copy
+    }
+
     /// Apple 是否明确拒绝电话/语音投递（含 iCloud 连接类文案）。
     static func isPhoneRefusal(status: Int, title: String?, message: String?) -> Bool {
         let combined = [title, message]

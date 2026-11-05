@@ -50,6 +50,36 @@ struct TwoFactorFlowTests {
         #expect(!TwoFactorFlow.isRetryable(status: 500))
     }
 
+    @Test("Mac fallback only after 503/433, never for rate limiting")
+    func macFallbackStatusPolicy() {
+        #expect(TwoFactorFlow.shouldRetryAsMac(status: 503))
+        #expect(TwoFactorFlow.shouldRetryAsMac(status: 433))
+        #expect(!TwoFactorFlow.shouldRetryAsMac(status: 429))
+        #expect(!TwoFactorFlow.shouldRetryAsMac(status: 403))
+        #expect(!TwoFactorFlow.shouldRetryAsMac(status: 200))
+    }
+
+    @Test("Mac fallback keeps method, body and JSON headers")
+    func macFallbackPreservesRequest() {
+        var request = URLRequest(url: URL(string: "https://gsa.apple.com/auth/verify/phone/securitycode")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("old-client", forHTTPHeaderField: "X-Mme-Client-Info")
+        request.setValue("old-agent", forHTTPHeaderField: "User-Agent")
+        let body = Data(#"{"securityCode":{"code":"123456"}}"#.utf8)
+        request.httpBody = body
+
+        let fallback = TwoFactorFlow.applyingFallbackIdentity(to: request)
+
+        #expect(fallback.httpMethod == "POST")
+        #expect(fallback.httpBody == body)
+        #expect(fallback.value(forHTTPHeaderField: "Content-Type") == "application/json")
+        #expect(fallback.value(forHTTPHeaderField: "Accept") == "application/json")
+        #expect(fallback.value(forHTTPHeaderField: "X-Mme-Client-Info") == TwoFactorFlow.fallbackClientInfo)
+        #expect(fallback.value(forHTTPHeaderField: "User-Agent") == TwoFactorFlow.fallbackUserAgent)
+    }
+
     @Test("Phone refusal only for refusal statuses and iCloud wording")
     func phoneRefusalClassification() {
         #expect(TwoFactorFlow.isPhoneRefusal(status: 403, title: nil, message: nil))
