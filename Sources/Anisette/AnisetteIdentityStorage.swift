@@ -19,3 +19,8 @@ public protocol AnisetteIdentityStorage: Sendable {
     /// 保存最新的 adi.pb。
     func saveAdiBlob(_ blob: Data)
 }
+
+public extension AnisetteIdentityStorage {
+    /// 清除已保存的 adi.pb。宿主未实现时保持无操作，便于旧宿主平滑升级。
+    func clearAdiBlob() {}
+}

@@ -495,9 +495,12 @@ public extension DeveloperPortal {
             default:
                 // -80045 / -80046 = anisette identity rejected — drop saved adi so next attempt can provision clean
                 if errorCode == -80045 || errorCode == -80046 || errorCode == 80045 || errorCode == 80046 {
+                    AnisetteDataManager.shared.identityStorage?.clearAdiBlob()
+                    AnisetteDataManager.shared.clearCache()
+                    // 清理旧版本明文写在 UserDefaults 里的副本（只删不写）。
                     UserDefaults.standard.removeObject(forKey: "SideSign.anisetteAdiBlob")
                     UserDefaults.standard.removeObject(forKey: "anisetteAdiBlob")
-                    debugLog("[SideSign] Cleared adi blob after \(errorCode) — reset adi.pb in SideStore and retry once on a Mac server")
+                    debugLog("[SideSign] Cleared adi blob after \(errorCode) — next attempt will provision a fresh identity")
                 }
                 throw ServerError.underlyingError(code: errorCode, message: errorDesc ?? "Authentication failed")
             }
